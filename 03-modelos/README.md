@@ -1,291 +1,183 @@
 # Modelos no dbt
 
-Esta seção aborda os diferentes tipos de modelos e suas aplicações no dbt, com exemplos práticos e diagramas explicativos.
+## Tipos de Modelos
 
-## 1. Tipos de Modelos
+### 1. Staging Models
+- Primeira camada de transformação
+- Padronização e limpeza inicial
+- Geralmente materializados como views
 
-### Arquitetura de Camadas
-```mermaid
-graph TD
-    A[Sources] --> B[Staging]
-    B --> C[Intermediate]
-    C --> D[Marts]
-    D --> E[Dimensões]
-    D --> F[Fatos]
+```sql
+-- models/staging/stg_customers.sql
+WITH source AS (
+    SELECT * FROM {{ source('raw', 'customers') }}
+),
+renamed AS (
+    SELECT
+        customer_id,
+        LOWER(first_name) as first_name,
+        LOWER(last_name) as last_name,
+        email,
+        created_at
+    FROM source
+)
+SELECT * FROM renamed
 ```
 
-### Sources
-- Representam as tabelas brutas do data warehouse
-- Configurados em `sources.yml`
-- Permitem rastreamento de freshness
-- Exemplo:
+### 2. Intermediate Models
+- Transformações intermediárias
+- Combinação de múltiplas fontes
+- Lógica de negócio inicial
+
+```sql
+-- models/intermediate/int_orders.sql
+WITH orders AS (
+    SELECT * FROM {{ ref('stg_orders') }}
+),
+order_items AS (
+    SELECT * FROM {{ ref('stg_order_items') }}
+),
+final AS (
+    SELECT 
+        o.order_id,
+        o.customer_id,
+        o.order_date,
+        COUNT(oi.item_id) as total_items,
+        SUM(oi.amount) as total_amount
+    FROM orders o
+    LEFT JOIN order_items oi ON o.order_id = oi.order_id
+    GROUP BY 1, 2, 3
+)
+SELECT * FROM final
+```
+
+### 3. Mart Models
+- Modelos finais para consumo
+- Agregações complexas
+- Métricas de negócio
+
+```sql
+-- models/marts/finance/customer_revenue.sql
+WITH customer_orders AS (
+    SELECT * FROM {{ ref('int_orders') }}
+),
+final AS (
+    SELECT 
+        customer_id,
+        COUNT(DISTINCT order_id) as total_orders,
+        SUM(total_amount) as lifetime_revenue,
+        AVG(total_amount) as avg_order_value,
+        MAX(order_date) as last_order_date
+    FROM customer_orders
+    GROUP BY 1
+)
+SELECT * FROM final
+```
+
+## Configurações de Modelo
+
+### 1. Materialização
 ```yaml
+# dbt_project.yml
+models:
+  my_project:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table
+      finance:
+        +schema: finance_mart
+```
+
+### 2. Configuração Individual
+```sql
+{{ config(
+    materialized='incremental',
+    unique_key='order_id',
+    schema='marts',
+    tags=['daily', 'finance']
+) }}
+
+SELECT * FROM ...
+```
+
+## Referências e Fontes
+
+### 1. Referências (ref)
+```sql
+-- Referenciando outro modelo
+SELECT * FROM {{ ref('stg_customers') }}
+```
+
+### 2. Fontes (source)
+```yaml
+# models/staging/schema.yml
+version: 2
 sources:
   - name: raw
     database: raw_data
     schema: public
     tables:
       - name: customers
-        loaded_at_field: updated_at
+        columns:
+          - name: customer_id
+            tests:
+              - unique
+              - not_null
 ```
 
-### Staging
-- Primeira camada de transformação
-- Limpeza e padronização básica
-- Nomenclatura: stg_[source]__[entity]
-- Exemplo:
 ```sql
-{{ config(materialized='view') }}
-
-SELECT
-    id as customer_id,
-    LOWER(email) as email,
-    INITCAP(first_name) as first_name,
-    created_at
-FROM {{ source('raw', 'customers') }}
-```
-
-### Intermediate
-- Modelos intermediários reutilizáveis
-- Transformações complexas
-- Nomenclatura: int_[entity]_[verb]
-- Exemplo:
-```sql
-{{ config(materialized='table') }}
-
-WITH customer_orders AS (
-    SELECT 
-        customer_id,
-        COUNT(*) as total_orders,
-        SUM(amount) as total_amount
-    FROM {{ ref('stg_orders') }}
-    GROUP BY 1
-)
-```
-
-### Marts
-- Modelos dimensionais finais
-- Organizados por área de negócio
-- Base para relatórios e análises
-
-### Dimensões e Fatos
-```mermaid
-graph LR
-    A[Dim_Customers] --> C[Fct_Orders]
-    B[Dim_Products] --> C
-    D[Dim_Dates] --> C
-```
-
-## 2. Materializações
-
-### Tipos de Materialização
-```mermaid
-graph TD
-    A[Materializações] --> B[Table]
-    A --> C[View]
-    A --> D[Incremental]
-    A --> E[Ephemeral]
-    A --> F[Snapshot]
-```
-
-### Table
-- Recria a tabela completa a cada execução
-- Ideal para dimensões pequenas
-```sql
-{{ config(materialized='table') }}
-```
-
-### View
-- Não armazena dados
-- Ideal para transformações simples
-```sql
-{{ config(materialized='view') }}
-```
-
-### Incremental
-- Atualiza apenas novos registros
-- Ideal para fatos grandes
-```sql
-{{ config(
-    materialized='incremental',
-    unique_key='order_id'
-) }}
-
-SELECT * FROM {{ source('raw', 'orders') }}
-{% if is_incremental() %}
-WHERE created_at > (SELECT MAX(created_at) FROM {{ this }})
-{% endif %}
-```
-
-### Ephemeral
-- Compilado como CTE
-- Não cria objeto no banco
-```sql
-{{ config(materialized='ephemeral') }}
-```
-
-### Snapshot
-- Rastreia mudanças tipo 2 (SCD)
-```sql
-{% snapshot customers_snapshot %}
-{{ config(
-    target_schema='snapshots',
-    strategy='timestamp',
-    unique_key='customer_id',
-    updated_at='updated_at'
-) }}
-
+-- Usando a fonte
 SELECT * FROM {{ source('raw', 'customers') }}
-{% endsnapshot %}
 ```
 
-## 3. Estrutura de Modelos
+## Documentação de Modelos
 
-### Organização de Diretórios
-```
-models/
-├── staging/
-│   ├── stg_customers.sql
-│   └── stg_orders.sql
-├── intermediate/
-│   └── int_customer_orders.sql
-└── marts/
-    ├── core/
-    │   ├── dim_customers.sql
-    │   └── fct_orders.sql
-    └── marketing/
-        └── customer_segmentation.sql
-```
-
-### Nomenclatura
-- staging: stg_[source]__[entity]
-- intermediate: int_[entity]_[verb]
-- marts: 
-  - dim_[entity]
-  - fct_[entity]
-
-### Documentação
 ```yaml
+# models/marts/schema.yml
 version: 2
+
 models:
-  - name: dim_customers
-    description: Dimensão de clientes
+  - name: customer_revenue
+    description: "Métricas financeiras agregadas por cliente"
     columns:
       - name: customer_id
-        description: Chave primária
+        description: "Identificador único do cliente"
         tests:
           - unique
           - not_null
-```
-
-## 4. Padrões e Boas Práticas
-
-### Modelagem Dimensional
-```mermaid
-graph TD
-    A[Fato] --> B[Dimensão 1]
-    A --> C[Dimensão 2]
-    A --> D[Dimensão 3]
-```
-
-### Granularidade
-- Definir nível adequado
-- Documentar claramente
-- Manter consistência
-
-### Testes de Qualidade
-```yaml
-models:
-  - name: fct_orders
-    tests:
-      - dbt_utils.equal_rowcount:
-          compare_model: ref('stg_orders')
-    columns:
-      - name: order_id
+      - name: lifetime_revenue
+        description: "Receita total do cliente"
         tests:
-          - unique
           - not_null
-          - relationships:
-              to: ref('dim_customers')
-              field: customer_id
-```
-
-## 5. Técnicas Avançadas
-
-### CTEs
-```sql
-WITH customers AS (
-    SELECT * FROM {{ ref('stg_customers') }}
-),
-
-orders AS (
-    SELECT * FROM {{ ref('stg_orders') }}
-),
-
-final AS (
-    SELECT 
-        c.*,
-        o.total_orders
-    FROM customers c
-    LEFT JOIN orders o ON c.customer_id = o.customer_id
-)
-
-SELECT * FROM final
-```
-
-### Jinja e Macros
-```sql
-{%- set payment_methods = ['credit_card', 'debit_card', 'pix'] -%}
-
-SELECT 
-    order_id,
-    {%- for payment in payment_methods %}
-    SUM(CASE WHEN payment_method = '{{ payment }}' THEN amount END) as {{ payment }}_amount
-    {%- if not loop.last %},{% endif -%}
-    {% endfor %}
-FROM {{ ref('stg_payments') }}
-GROUP BY 1
-```
-
-### Packages
-```yaml
-packages:
-  - package: dbt-labs/dbt_utils
-    version: 0.8.0
+          - positive_values
 ```
 
 ## Exercícios Práticos
 
-1. **Criar modelo staging**
-   - Criar `stg_customers.sql` e `stg_orders.sql`
-   - Implementar testes básicos
-   - Documentar colunas
+1. **Staging Models**
+   - Criar modelos de staging para customers, orders e products
+   - Implementar padronização de nomes e tipos
+   - Adicionar testes básicos
 
-2. **Implementar modelo incremental**
-   - Criar `fct_daily_sales.sql`
-   - Configurar estratégia incremental
-   - Adicionar testes de integridade
+2. **Intermediate Models**
+   - Criar modelo para análise de pedidos
+   - Implementar joins entre tabelas
+   - Calcular métricas intermediárias
 
-3. **Desenvolver dimensão SCD Type 2**
-   - Criar snapshot para `dim_customers`
-   - Implementar campos de controle
-   - Testar diferentes cenários
+3. **Mart Models**
+   - Desenvolver marts para finanças e vendas
+   - Implementar agregações complexas
+   - Configurar materializações apropriadas
 
-4. **Criar fato com agregações**
-   - Desenvolver `fct_order_summary`
-   - Implementar métricas de negócio
-   - Criar testes de reconciliação
-
-5. **Documentar e testar modelos**
-   - Criar documentação completa
-   - Implementar testes genéricos e singulares
-   - Gerar documentação com lineage
+4. **Documentação**
+   - Documentar todos os modelos
+   - Adicionar descrições para colunas
+   - Implementar testes de qualidade
 
 ## Recursos Adicionais
 
-- [Modelos no dbt](https://docs.getdbt.com/docs/build/models)
+- [Modelos dbt](https://docs.getdbt.com/docs/build/models)
 - [Materializações](https://docs.getdbt.com/docs/build/materializations)
-- [Jinja e Macros](https://docs.getdbt.com/docs/build/jinja-macros)
-- [Testes](https://docs.getdbt.com/docs/build/tests)
-- [Documentação](https://docs.getdbt.com/docs/collaborate/documentation)
-- [Packages](https://hub.getdbt.com) 
+- [Referências e Fontes](https://docs.getdbt.com/docs/build/sources)
+- [Documentação](https://docs.getdbt.com/docs/collaborate/documentation) 
